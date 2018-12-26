@@ -3,14 +3,17 @@ import tensorflow as tf
 import tensorflow.contrib.cudnn_rnn as cudnn_rnn
 from tensorflow.python.ops import ctc_ops
 import numpy as np
+import json
+from typing import Generator
 
-from calamari_ocr.ocr.backends.model_interface import ModelInterface
+from calamari_ocr.ocr.backends.model_interface import ModelInterface, NetworkPredictionResult
 from calamari_ocr.proto import LayerParams, NetworkParams
 
 
 class TensorflowModel(ModelInterface):
-    def __init__(self, network_proto, graph, session, graph_type="train", batch_size=1, reuse_weights=False):
-        super().__init__(network_proto, graph_type, batch_size, implementation_handles_batching=True)
+    def __init__(self, network_proto, graph, session, graph_type="train", batch_size=1, reuse_weights=False,
+                 input_dataset=None, codec=None):
+        super().__init__(network_proto, graph_type, batch_size, input_dataset=input_dataset, codec=codec)
         self.graph = graph
         self.session = session
         self.gpu_available = any([d.device_type == "GPU" for d in self.session.list_devices()])
@@ -26,26 +29,23 @@ class TensorflowModel(ModelInterface):
         with self.graph.as_default():
             tf.set_random_seed(self.network_proto.backend.random_seed)
 
-            # inputs either as placeholders or as data set (faster)
-            if self.implementation_handles_batching:
-                self.inputs, self.input_seq_len, self.targets, self.dropout_rate, self.data_iterator = \
-                    self.create_dataset_inputs(batch_size, network_proto.features)
-            else:
-                self.data_iterator = None
-                self.inputs, self.input_seq_len, self.targets, self.dropout_rate = self.create_placeholders()
+            # inputs as data set (faster)
+            self.inputs, self.input_seq_len, self.targets, self.dropout_rate, self.data_iterator, self.serialized_params = \
+                self.create_dataset_inputs(batch_size, network_proto.features)
 
             # create network and solver (if train)
             if graph_type == "train":
-                self.output_seq_len, self.time_major_logits, self.time_major_softmax, self.logits, self.softmax, self.decoded, self.sparse_decoded = \
+                self.output_seq_len, self.time_major_logits, self.time_major_softmax, self.logits, self.softmax, self.decoded, self.sparse_decoded, self.scale_factor = \
                     self.create_network(self.inputs, self.input_seq_len, self.dropout_rate, reuse_variables=reuse_weights)
                 self.train_op, self.loss, self.cer = self.create_solver(self.targets, self.time_major_logits, self.logits, self.output_seq_len, self.decoded)
             elif graph_type == "test":
-                self.output_seq_len, self.time_major_logits, self.time_major_softmax, self.logits, self.softmax, self.decoded, self.sparse_decoded = \
+                self.output_seq_len, self.time_major_logits, self.time_major_softmax, self.logits, self.softmax, self.decoded, self.sparse_decoded, self.scale_factor = \
                     self.create_network(self.inputs, self.input_seq_len, self.dropout_rate, reuse_variables=reuse_weights)
                 self.cer = self.create_cer(self.decoded, self.targets)
             else:
-                self.output_seq_len, self.time_major_logits, self.time_major_softmax, self.logits, self.softmax, self.decoded, self.sparse_decoded = \
+                self.output_seq_len, self.time_major_logits, self.time_major_softmax, self.logits, self.softmax, self.decoded, self.sparse_decoded, self.scale_factor = \
                     self.create_network(self.inputs, self.input_seq_len, self.dropout_rate, reuse_variables=reuse_weights)
+
 
     def is_gpu_available(self):
         # create a dummy session and list available devices
@@ -64,13 +64,14 @@ class TensorflowModel(ModelInterface):
         batch_size = tf.shape(inputs)[0]
         gpu_enabled = self.gpu_available
 
-        with tf.variable_scope("", reuse=reuse_variables) as scope:
+        with tf.variable_scope("cnn_lstm", reuse=reuse_variables) as scope:
             no_layers = len(network_proto.layers) == 0
             if not no_layers:
                 has_conv_or_pool = network_proto.layers[0].type != LayerParams.LSTM
             else:
                 has_conv_or_pool = False
 
+            factor = 1
             if has_conv_or_pool:
                 cnn_inputs = tf.reshape(inputs, [batch_size, -1, network_proto.features, 1])
                 shape = seq_len, network_proto.features
@@ -102,6 +103,7 @@ class TensorflowModel(ModelInterface):
 
                         shape = (tf.to_int32(shape[0] // layer.stride.x),
                                  shape[1] // layer.stride.y)
+                        factor *= layer.stride.x
                     else:
                         raise Exception("Unknown layer of type %s" % layer.type)
 
@@ -131,13 +133,13 @@ class TensorflowModel(ModelInterface):
                     def get_lstm_cell(num_hidden):
                         return cudnn_rnn.CudnnCompatibleLSTMCell(num_hidden, reuse=reuse_variables)
 
-                    fw, bw = zip(*[(get_lstm_cell(hidden_nodes), get_lstm_cell(hidden_nodes)) for lstm in lstm_layers])
+                    fw, bw = zip(*[(get_lstm_cell(hidden_nodes), get_lstm_cell(hidden_nodes)) for _ in lstm_layers])
 
                     time_major_outputs, output_fw, output_bw \
                         = tf.contrib.rnn.stack_bidirectional_dynamic_rnn(list(fw), list(bw), time_major_inputs,
                                                                          sequence_length=lstm_seq_len,
                                                                          dtype=tf.float32,
-                                                                         scope="{}cudnn_lstm/stack_bidirectional_rnn".format(scope.name),
+                                                                         scope="cudnn_lstm/stack_bidirectional_rnn",
                                                                          time_major=True,
                                                                          )
 
@@ -212,46 +214,50 @@ class TensorflowModel(ModelInterface):
                 tf.identity(decoded.dense_shape, name="decoded_shape"),
             )
 
-            return lstm_seq_len, time_major_logits, time_major_softmax, logits, softmax, decoded, sparse_decoded
+            return lstm_seq_len, time_major_logits, time_major_softmax, logits, softmax, decoded, sparse_decoded, factor
 
     def create_placeholders(self):
-        with tf.variable_scope("", reuse=False) as scope:
+        with tf.variable_scope("cnn_lstm", reuse=False) as scope:
             inputs = tf.placeholder(tf.float32, shape=(None, None, self.network_proto.features), name="inputs")
             seq_len = tf.placeholder(tf.int32, shape=(None,), name="seq_len")
             targets = tf.sparse_placeholder(tf.int32, shape=(None, None), name="targets")
             dropout_rate = tf.placeholder(tf.float32, shape=(), name="dropout_rate")
+            serialized_params = tf.placeholder(tf.string, shape=(None,), name='serialized_params')
 
-        return inputs, seq_len, targets, dropout_rate
+        return inputs, seq_len, targets, dropout_rate, serialized_params
 
     def create_dataset_inputs(self, batch_size, line_height, buffer_size=1000):
-        with tf.variable_scope("", reuse=False):
+        buffer_size = min(buffer_size, len(self.input_dataset) if self.input_dataset else 10)
+        with tf.variable_scope("cnn_lstm", reuse=False):
             def gen():
-                for i, l in zip(self.raw_images, self.raw_labels):
+                for i, l, d in self.input_dataset.generator():
                     if self.graph_type == "train" and len(l) == 0:
                         continue
 
-                    yield i, l, [len(i)], [len(l)]
+                    l = self.codec.encode(l) if l else []
+                    yield i, l, [len(i)], [len(l)], [json.dumps(d)]
 
-            def convert_to_sparse(data, labels, len_data, len_labels):
+
+            def convert_to_sparse(data, labels, len_data, len_labels, ser_data):
                 indices = tf.where(tf.not_equal(labels, -1))
                 values = tf.gather_nd(labels, indices) - 1
                 shape = tf.shape(labels, out_type=tf.int64)
-                return data / 255, tf.SparseTensor(indices, values, shape), len_data, len_labels
+                return data / 255, tf.SparseTensor(indices, values, shape), len_data, len_labels, ser_data
 
-            dataset = tf.data.Dataset.from_generator(gen, (tf.float32, tf.int32, tf.int32, tf.int32))
+            dataset = tf.data.Dataset.from_generator(gen, (tf.float32, tf.int32, tf.int32, tf.int32, tf.string))
             if self.graph_type == "train":
                 dataset = dataset.repeat().shuffle(buffer_size, seed=self.network_proto.backend.random_seed)
             else:
                 pass
 
-            dataset = dataset.padded_batch(batch_size, ([None, line_height], [None], [1], [1]),
-                                           padding_values=(np.float32(0), np.int32(-1), np.int32(0), np.int32(0)))
+            dataset = dataset.padded_batch(batch_size, ([None, line_height], [None], [1], [1], [1]),
+                                           padding_values=(np.float32(0), np.int32(-1), np.int32(0), np.int32(0), ''))
             dataset = dataset.map(convert_to_sparse)
 
             data_initializer = dataset.prefetch(5).make_initializable_iterator()
             inputs = data_initializer.get_next()
             dropout_rate = tf.placeholder(tf.float32, shape=(), name="dropout_rate")
-            return inputs[0], tf.reshape(inputs[2], [-1]), inputs[1], dropout_rate, data_initializer
+            return inputs[0], tf.reshape(inputs[2], [-1]), inputs[1], dropout_rate, data_initializer, inputs[4]
 
     def create_cer(self, decoded, targets):
         # character error rate
@@ -361,8 +367,8 @@ class TensorflowModel(ModelInterface):
             saver.restore(self.session, filepath)
 
     def realign_model_labels(self, indices_to_delete, indices_to_add):
-        W = self.graph.get_tensor_by_name("W:0")
-        B = self.graph.get_tensor_by_name("B:0")
+        W = self.graph.get_tensor_by_name("cnn_lstm/W:0")
+        B = self.graph.get_tensor_by_name("cnn_lstm/B:0")
 
         # removed desired entries from the data
         # IMPORTANT: Blank index is last in tensorflow but 0 in indices!
@@ -436,51 +442,63 @@ class TensorflowModel(ModelInterface):
 
         return out
 
-    def predict_raw(self, x, len_x):
-        return self.session.run(
+    def predict_raw(self, x, len_x) -> Generator[NetworkPredictionResult, None, None]:
+        out = self.session.run(
             [self.softmax, self.output_seq_len, self.decoded],
             feed_dict={
                 self.inputs: x,
                 self.input_seq_len: len_x,
                 self.dropout_rate: 0,
             })
+        out = out[0:2] + [TensorflowModel.__sparse_to_lists(out[2])]
+        for sm, sl, dec in zip(*out):
+            yield NetworkPredictionResult(softmax=sm,
+                                          output_length=sl,
+                                          decoded=dec,
+                                          )
 
-    def predict_dataset(self):
-        return self.session.run(
-            [self.softmax, self.output_seq_len, self.decoded],
-            feed_dict={
-                self.dropout_rate: 0,
-            })
+    def predict_dataset(self) -> Generator[NetworkPredictionResult, None, None]:
+        out = self.session.run(
+                [self.softmax, self.output_seq_len, self.serialized_params, self.decoded, self.targets],
+                feed_dict={
+                    self.dropout_rate: 0,
+                })
+        out = out[0:3] + list(map(TensorflowModel.__sparse_to_lists, out[3:5]))
+        for sm, length, param, dec, gt in zip(*out):
+            # decode encoded params from json. On python<=3.5 this are bytes, else it already is a str
+            enc_param = param[0]
+            enc_param = json.loads(enc_param.decode("utf-8") if isinstance(enc_param, bytes) else enc_param)
+            # return prediction result
+            yield NetworkPredictionResult(softmax=sm,
+                                          output_length=length,
+                                          decoded=dec,
+                                          params=enc_param,
+                                          ground_truth=self.codec.decode(gt) if gt is not None else None,
+                                          )
 
-    def train(self, batch_x, batch_y):
-        if batch_x and batch_y:
-            x, len_x = TensorflowModel.__sparse_data_to_dense(batch_x)
-            y = TensorflowModel.__to_sparse_matrix(batch_y)
-
-            cost, probs, seq_len, ler, decoded = self.train_batch(x, len_x, y)
-            gt = batch_y
-        else:
-            cost, probs, seq_len, ler, decoded, gt = self.train_dataset()
-            gt = TensorflowModel.__sparse_to_lists(gt)
+    def train(self):
+        cost, probs, seq_len, ler, decoded, gt = self.train_dataset()
+        gt = TensorflowModel.__sparse_to_lists(gt)
+        decoded = TensorflowModel.__sparse_to_lists(decoded)
 
         probs = np.roll(probs, 1, axis=2)
         return {
             "loss": cost,
             "probabilities": probs,
             "ler": ler,
-            "decoded": TensorflowModel.__sparse_to_lists(decoded),
+            "decoded": decoded,
             "gt": gt,
             "logits_lengths": seq_len,
         }
 
-    def predict(self):
+    def predict(self) -> Generator[NetworkPredictionResult, None, None]:
         try:
             while True:
-                probs, seq_len, decoded = self.predict_dataset()
-                probs = np.roll(probs, 1, axis=2)
-                # decoded = TensorflowBackend.__sparse_to_lists(decoded)
-                for l, s in zip(probs, seq_len):
-                    yield self.ctc_decoder.decode(l[:s])
+                for pred in self.predict_dataset():
+                    pred.softmax = np.roll(pred.softmax, 1, axis=1)
+                    l, s = pred.softmax, pred.output_length
+                    pred.decoded = self.ctc_decoder.decode(l[:s])
+                    yield pred
 
         except tf.errors.OutOfRangeError as e:
             # no more data available
@@ -517,7 +535,10 @@ class TensorflowModel(ModelInterface):
     @staticmethod
     def __sparse_to_lists(sparse, shift_values=1):
         indices, values, dense_shape = sparse
+        return TensorflowModel._convert_targets_to_lists(indices, values, dense_shape, shift_values=shift_values)
 
+    @staticmethod
+    def _convert_targets_to_lists(indices, values, dense_shape, shift_values=1):
         out = [[] for _ in range(dense_shape[0])]
 
         for index, value in zip(indices, values):
@@ -525,4 +546,7 @@ class TensorflowModel(ModelInterface):
             assert(len(out[x]) == y)  # consistency check
             out[x].append(value + shift_values)
 
-        return out
+        return [np.asarray(o, dtype=np.int64) for o in out]
+
+    def output_to_input_position(self, x):
+        return x * self.scale_factor

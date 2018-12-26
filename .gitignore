@@ -6,8 +6,17 @@
 checkpoint
 
 
+# Operating system
+# ================
+
+.DS_Store
+
 # Python general
 # ==============
+
+# gitlab-runner
+builds
+cache
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -1,0 +1,15 @@
+name: calamari
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.7
+  - lxml
+  - scikit-image
+  - tqdm
+  - python-bidi
+  - edit_distance
+  - xlsxwriter
+  - pip:
+    - tf-nightly-gpu
+    - git+https://github.com/Calamari-OCR/calamari.git@dev
